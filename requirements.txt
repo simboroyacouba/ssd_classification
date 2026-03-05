@@ -1,0 +1,9 @@
+torch>=2.0.0
+torchvision>=0.15.0
+pycocotools
+Pillow
+matplotlib
+numpy
+pyyaml
+tqdm
+python-dotenv
