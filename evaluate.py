@@ -6,6 +6,7 @@ Configuration: .env + classes.yaml
 
 import os
 import json
+import time
 import yaml
 import numpy as np
 import torch
@@ -301,6 +302,31 @@ class MetricsCalculator:
         return results
 
 
+def count_parameters(model):
+    """Retourne le nombre de paramètres du modèle en millions."""
+    return sum(p.numel() for p in model.parameters()) / 1e6
+
+
+def benchmark_inference(model, device, image_size, n_warmup=10, n_runs=50):
+    """Mesure la vitesse d'inférence (ms/image) et le FPS GPU sur entrée synthétique."""
+    dummy = torch.randn(1, 3, image_size, image_size).to(device)
+    model.eval()
+    with torch.no_grad():
+        for _ in range(n_warmup):
+            _ = model([dummy[0]])
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(n_runs):
+            _ = model([dummy[0]])
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+        t1 = time.perf_counter()
+    elapsed_ms = (t1 - t0) * 1000.0 / n_runs
+    fps = 1000.0 / elapsed_ms
+    return elapsed_ms, fps
+
+
 def plot_metrics(results, output_dir):
     os.makedirs(output_dir, exist_ok=True)
     class_names = list(results['mAP_per_class'].keys())
@@ -342,6 +368,9 @@ def main():
 
     model, classes, cat_mapping, model_name, image_size = load_model(model_path, device)
 
+    num_params = count_parameters(model)
+    print(f"   Paramètres: {num_params:.2f}M")
+
     test_info_path = find_test_info(model_path)
     if test_info_path is None:
         print("❌ test_info.json non trouvé! Lancez generate_test_info.py d'abord.")
@@ -370,6 +399,11 @@ def main():
     test_loader  = DataLoader(test_dataset, batch_size=1, shuffle=False,
                               collate_fn=collate_fn, num_workers=0)
 
+    print("\n⚡ Benchmark inférence...")
+    infer_ms, fps_gpu = benchmark_inference(model, device, eval_image_size)
+    print(f"   Vitesse inférence: {infer_ms:.2f} ms/image")
+    print(f"   FPS GPU:           {fps_gpu:.1f}")
+
     print("\n📊 Évaluation sur le TEST SET...")
     calc = MetricsCalculator(classes, CONFIG["iou_thresholds"])
 
@@ -389,22 +423,28 @@ def main():
 
     results = calc.compute()
     results['evaluation_info'] = {
-        'dataset':    'TEST SET (10%)',
-        'num_images': len(test_image_ids),
-        'model_path': model_path,
-        'model_name': model_name,
-        'timestamp':  datetime.now().isoformat()
+        'dataset':         'TEST SET (10%)',
+        'num_images':      len(test_image_ids),
+        'model_path':      model_path,
+        'model_name':      model_name,
+        'timestamp':       datetime.now().isoformat(),
+        'params_M':        round(num_params, 2),
+        'infer_ms':        round(infer_ms, 2),
+        'fps_gpu':         round(fps_gpu, 1),
     }
 
     print("\n" + "=" * 70)
     print("   📊 RÉSULTATS SUR LE TEST SET")
     print("=" * 70)
-    print(f"   Images testées: {len(test_image_ids)}")
-    print(f"   mAP@50:    {results['mAP50']:.4f} ({results['mAP50']*100:.2f}%)")
-    print(f"   mAP@50:95: {results['mAP50_95']:.4f}")
-    print(f"   Precision: {results['overall']['iou_0.5']['Precision']:.4f}")
-    print(f"   Recall:    {results['overall']['iou_0.5']['Recall']:.4f}")
-    print(f"   F1-Score:  {results['overall']['iou_0.5']['F1']:.4f}")
+    print(f"   Images testées:          {len(test_image_ids)}")
+    print(f"   Paramètres (M):          {num_params:.2f}M")
+    print(f"   Vitesse Inférence (ms↓): {infer_ms:.2f} ms/image")
+    print(f"   FPS GPU:                 {fps_gpu:.1f}")
+    print(f"   mAP@50:                  {results['mAP50']:.4f} ({results['mAP50']*100:.2f}%)")
+    print(f"   mAP@50:95:               {results['mAP50_95']:.4f}")
+    print(f"   Precision:               {results['overall']['iou_0.5']['Precision']:.4f}")
+    print(f"   Recall:                  {results['overall']['iou_0.5']['Recall']:.4f}")
+    print(f"   F1-Score:                {results['overall']['iou_0.5']['F1']:.4f}")
     print("=" * 70)
     if results['mAP_per_class']:
         print("\n   Par classe (IoU=0.5):")
@@ -419,6 +459,9 @@ def main():
     with open(os.path.join(CONFIG["output_dir"], "evaluation_report_test_set.txt"), 'w', encoding='utf-8') as f:
         f.write(f"ÉVALUATION SSD ({model_name}) - TEST SET - {datetime.now()}\n{'='*50}\n\n")
         f.write(f"Images testées: {len(test_image_ids)}\nModèle: {model_path}\n\n")
+        f.write(f"Paramètres (M):          {num_params:.2f}M\n")
+        f.write(f"Vitesse Inférence (ms↓): {infer_ms:.2f} ms/image\n")
+        f.write(f"FPS GPU:                 {fps_gpu:.1f}\n\n")
         f.write(f"mAP@50: {results['mAP50']:.4f} ({results['mAP50']*100:.2f}%)\n")
         f.write(f"mAP@50:95: {results['mAP50_95']:.4f}\n")
         f.write(f"Precision: {results['overall']['iou_0.5']['Precision']:.4f}\n")
