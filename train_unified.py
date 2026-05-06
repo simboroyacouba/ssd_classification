@@ -73,6 +73,7 @@ def build_config(args):
         "save_every":       args.save_every,
         "score_threshold":  args.score_threshold,
         "pretrained":       not args.no_pretrained,
+        "attention":        args.attention,
         "grad_clip":        args.grad_clip,
         "class_weights":    args.class_weights,
     }
@@ -221,10 +222,86 @@ def collate_fn(batch):
 
 
 # =============================================================================
+# MODULES D'ATTENTION
+# =============================================================================
+
+class ChannelAttention(torch.nn.Module):
+    """SE-Net : attention canal via avg+max pooling."""
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        mid = max(channels // reduction, 4)
+        self.avg_pool = torch.nn.AdaptiveAvgPool2d(1)
+        self.max_pool = torch.nn.AdaptiveMaxPool2d(1)
+        self.fc = torch.nn.Sequential(
+            torch.nn.Conv2d(channels, mid, 1, bias=False),
+            torch.nn.ReLU(inplace=True),
+            torch.nn.Conv2d(mid, channels, 1, bias=False),
+        )
+        self.sigmoid = torch.nn.Sigmoid()
+
+    def forward(self, x):
+        return x * self.sigmoid(self.fc(self.avg_pool(x)) + self.fc(self.max_pool(x)))
+
+
+class SpatialAttention(torch.nn.Module):
+    """CBAM : attention spatiale via avg+max sur les canaux."""
+    def __init__(self):
+        super().__init__()
+        self.conv    = torch.nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False)
+        self.sigmoid = torch.nn.Sigmoid()
+
+    def forward(self, x):
+        avg = x.mean(dim=1, keepdim=True)
+        mx, _ = x.max(dim=1, keepdim=True)
+        return x * self.sigmoid(self.conv(torch.cat([avg, mx], dim=1)))
+
+
+class CBAM(torch.nn.Module):
+    """Channel + Spatial Attention Module."""
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.ca = ChannelAttention(channels, reduction)
+        self.sa = SpatialAttention()
+
+    def forward(self, x):
+        return self.sa(self.ca(x))
+
+
+class AttentionBackbone(torch.nn.Module):
+    """Wrapper : applique un module d'attention sur chaque feature map du backbone SSD."""
+    def __init__(self, backbone, channels, attention_type):
+        super().__init__()
+        self.backbone = backbone
+        if attention_type == 'se':
+            self.attentions = torch.nn.ModuleList([ChannelAttention(c) for c in channels])
+        elif attention_type == 'cbam':
+            self.attentions = torch.nn.ModuleList([CBAM(c) for c in channels])
+        else:
+            self.attentions = torch.nn.ModuleList([torch.nn.Identity() for _ in channels])
+
+    def forward(self, x):
+        features = self.backbone(x)
+        result = {}
+        for i, (k, v) in enumerate(features.items()):
+            attn = self.attentions[i] if i < len(self.attentions) else torch.nn.Identity()
+            result[k] = attn(v)
+        return result
+
+
+def _probe_backbone_channels(backbone, image_size):
+    """Détecte les tailles de canaux de chaque feature map via un forward factice."""
+    backbone.eval()
+    with torch.no_grad():
+        dummy = torch.zeros(1, 3, image_size, image_size)
+        feats = backbone(dummy)
+    return [f.shape[1] for f in feats.values()]
+
+
+# =============================================================================
 # MODÈLE
 # =============================================================================
 
-def build_model(model_name, num_classes, pretrained=True):
+def build_model(model_name, num_classes, pretrained=True, attention_type=None, image_size=300):
     if model_name == "ssd300_vgg16":
         weights = SSD300_VGG16_Weights.DEFAULT if pretrained else None
         model   = ssd300_vgg16(weights=weights)
@@ -253,6 +330,12 @@ def build_model(model_name, num_classes, pretrained=True):
         )
     else:
         raise ValueError(f"Modèle inconnu: {model_name}")
+
+    if attention_type and attention_type != 'none':
+        channels = _probe_backbone_channels(model.backbone, image_size)
+        model.backbone = AttentionBackbone(model.backbone, channels, attention_type)
+        print(f"   Attention '{attention_type}' ajoutée sur {len(channels)} feature maps : {channels}")
+
     return model
 
 
@@ -426,6 +509,9 @@ def main():
     parser.add_argument("--score-threshold",  type=float, default=float(os.getenv("SCORE_THRESHOLD", "0.3")))
     parser.add_argument("--grad-clip",        type=float, default=float(os.getenv("GRAD_CLIP",   "1.0")))
     parser.add_argument("--no-pretrained",    action="store_true")
+    parser.add_argument("--attention",        default=os.getenv("ATTENTION", "none"),
+                        choices=["none", "se", "cbam"],
+                        help="Mecanisme d'attention sur les feature maps du backbone (none/se/cbam)")
     parser.add_argument("--class-weights",    action="store_true", default=os.getenv("CLASS_WEIGHTS","0")=="1",
                         help="Activer le surechantillonnage pondéré par classe (classes rares favorisees)")
     args = parser.parse_args()
@@ -501,7 +587,8 @@ def main():
     print(f"\n   Train: {len(train_dataset)} | Val: {len(val_dataset)} | Test: {len(test_ids)} images")
 
     print(f"\n   Chargement {config['model_name']} (pretrained={config['pretrained']})...")
-    model = build_model(config["model_name"], num_classes, config["pretrained"])
+    model = build_model(config["model_name"], num_classes, config["pretrained"],
+                        config["attention"], image_size)
     model.to(device)
 
     params       = [p for p in model.parameters() if p.requires_grad]
