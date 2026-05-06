@@ -1,0 +1,24 @@
+ÉVALUATION SSD (ssd300_vgg16 + ssd300_vgg16) - TEST SET - 2026-05-06 10:19:27.097877
+==================================================
+
+Images testées: 41
+Modèle: ./runs/detect/train\nadir\ssd_nadir_20260506_092501\best_model.pth + ./runs/detect/train\oblique\ssd_oblique_20260506_093235\best_model.pth
+
+Paramètres (M):          47.89M
+Vitesse Inférence (ms↓): 176.24 ms/image
+FPS GPU:                 5.7
+
+mAP@50: 0.6412 (64.12%)
+mAP@50:95: 0.3482
+Precision: 0.6412
+Recall: 0.4176
+F1-Score: 0.5058
+
+
+PAR CLASSE (IoU=0.5)
+--------------------------------------------------
+panneau_solaire: P=0.8272 R=0.6262 F1=0.7128
+batiment_peint: P=0.3333 R=0.4000 F1=0.3636
+batiment_non_enduit: P=0.4500 R=0.2308 F1=0.3051
+batiment_enduit: P=0.5088 R=0.5577 F1=0.5321
+menuiserie_metallique: P=0.0000 R=0.0000 F1=0.0000

@@ -11,6 +11,7 @@ import yaml
 import argparse
 import numpy as np
 import torch
+import torch.nn as nn
 import torchvision.transforms.functional as TF
 from torch.utils.data import Dataset, DataLoader
 from torchvision.models.detection import (
@@ -66,10 +67,78 @@ CONFIG["classes"] = load_classes(CONFIG["classes_file"])
 
 
 # =============================================================================
+# ATTENTION MODULES (pour charger les modèles entraînés avec --attention)
+# =============================================================================
+
+class ChannelAttention(nn.Module):
+    def __init__(self, in_channels, reduction=16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        mid = max(in_channels // reduction, 1)
+        self.fc = nn.Sequential(nn.Linear(in_channels, mid, bias=False),
+                                nn.ReLU(inplace=True),
+                                nn.Linear(mid, in_channels, bias=False))
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        b, c, _, _ = x.shape
+        avg = self.fc(self.avg_pool(x).view(b, c))
+        mx  = self.fc(self.max_pool(x).view(b, c))
+        return x * self.sigmoid(avg + mx).view(b, c, 1, 1)
+
+
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super().__init__()
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=kernel_size // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg = x.mean(dim=1, keepdim=True)
+        mx  = x.max(dim=1, keepdim=True).values
+        return x * self.sigmoid(self.conv(torch.cat([avg, mx], dim=1)))
+
+
+class CBAM(nn.Module):
+    def __init__(self, in_channels, reduction=16):
+        super().__init__()
+        self.ca = ChannelAttention(in_channels, reduction)
+        self.sa = SpatialAttention()
+
+    def forward(self, x):
+        return self.sa(self.ca(x))
+
+
+class AttentionBackbone(nn.Module):
+    def __init__(self, backbone, channels, attention_type='cbam'):
+        super().__init__()
+        self.backbone = backbone
+        attn_cls = CBAM if attention_type == 'cbam' else ChannelAttention
+        self.attentions = nn.ModuleList([attn_cls(c) for c in channels])
+
+    def forward(self, x):
+        features = self.backbone(x)
+        if isinstance(features, dict):
+            keys = list(features.keys())
+            return {k: self.attentions[i](features[k]) for i, k in enumerate(keys)}
+        return [self.attentions[i](f) for i, f in enumerate(features)]
+
+
+def _probe_backbone_channels(backbone, image_size):
+    dummy = torch.zeros(1, 3, image_size, image_size)
+    with torch.no_grad():
+        out = backbone(dummy)
+    if isinstance(out, dict):
+        return [v.shape[1] for v in out.values()]
+    return [f.shape[1] for f in out]
+
+
+# =============================================================================
 # CHARGEMENT DU MODÈLE
 # =============================================================================
 
-def build_model_skeleton(model_name, num_classes):
+def build_model(model_name, num_classes, attention_type=None, image_size=300):
     if model_name == "ssd300_vgg16":
         model = ssd300_vgg16(weights=None)
         in_channels = [512, 1024, 512, 256, 256, 256]
@@ -88,20 +157,26 @@ def build_model_skeleton(model_name, num_classes):
             in_channels=in_channels, num_anchors=num_anchors, num_classes=num_classes)
     else:
         raise ValueError(f"Modèle inconnu: {model_name}")
+
+    if attention_type and attention_type != 'none':
+        channels = _probe_backbone_channels(model.backbone, image_size)
+        model.backbone = AttentionBackbone(model.backbone, channels, attention_type)
+
     return model
 
 
 def load_model(model_path, device):
-    print(f"🧠 Chargement du modèle: {model_path}")
-    checkpoint  = torch.load(model_path, map_location=device)
-    num_classes = checkpoint.get('num_classes', len(CONFIG["classes"]))
-    classes     = checkpoint.get('classes', CONFIG["classes"])
-    cat_mapping = checkpoint.get('cat_mapping', {})
-    model_name  = checkpoint.get('model_name', os.getenv("SSD_MODEL", "ssd300_vgg16"))
-    image_size  = checkpoint.get('image_size', 300)
+    print(f"   Chargement: {model_path}")
+    checkpoint     = torch.load(model_path, map_location=device, weights_only=False)
+    num_classes    = checkpoint.get('num_classes', len(CONFIG["classes"]))
+    classes        = checkpoint.get('classes', CONFIG["classes"])
+    cat_mapping    = checkpoint.get('cat_mapping', {})
+    model_name     = checkpoint.get('model_name', os.getenv("SSD_MODEL", "ssd300_vgg16"))
+    image_size     = checkpoint.get('image_size', 300)
+    attention_type = checkpoint.get('attention', None)
 
-    model = build_model_skeleton(model_name, num_classes)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    model = build_model(model_name, num_classes, attention_type, image_size)
+    model.load_state_dict(checkpoint['model_state_dict'], strict=False)
     model.to(device)
     model.eval()
 
@@ -115,16 +190,24 @@ def _list_output_dirs(mode):
     """Retourne les repertoires d'entrainement tries du plus recent, filtres par mode."""
     candidates = []
     base_output = os.getenv("OUTPUT_DIR", "./output")
+    runs_base   = os.getenv("RUNS_DIR",   "./runs/detect/train")
 
     if mode in ("nadir", "oblique"):
-        mode_base = os.path.join(base_output, mode)
-        if os.path.exists(mode_base):
-            prefix = f"ssd_{mode}_"
-            dirs = [d for d in os.listdir(mode_base)
-                    if os.path.isdir(os.path.join(mode_base, d)) and d.startswith(prefix)]
-            for d in sorted(dirs, reverse=True):
-                candidates.append(os.path.join(mode_base, d))
+        prefix = f"ssd_{mode}_"
+        # train.py → ./output/<mode>/
+        mode_base_old = os.path.join(base_output, mode)
+        if os.path.exists(mode_base_old):
+            for d in sorted(os.listdir(mode_base_old), reverse=True):
+                if os.path.isdir(os.path.join(mode_base_old, d)) and d.startswith(prefix):
+                    candidates.append(os.path.join(mode_base_old, d))
+        # train_unified.py → ./runs/detect/train/<mode>/
+        mode_base_new = os.path.join(runs_base, mode)
+        if os.path.exists(mode_base_new):
+            for d in sorted(os.listdir(mode_base_new), reverse=True):
+                if os.path.isdir(os.path.join(mode_base_new, d)) and d.startswith(prefix):
+                    candidates.append(os.path.join(mode_base_new, d))
     else:
+        # mode "all" / "unified" : train.py → ./output/
         if os.path.exists(base_output):
             dirs = [d for d in os.listdir(base_output)
                     if os.path.isdir(os.path.join(base_output, d))
@@ -133,6 +216,13 @@ def _list_output_dirs(mode):
                     and not d.startswith("ssd_oblique_")]
             for d in sorted(dirs, reverse=True):
                 candidates.append(os.path.join(base_output, d))
+        # train_unified.py → ./runs/detect/train/ (niveau racine)
+        if os.path.exists(runs_base):
+            dirs = [d for d in os.listdir(runs_base)
+                    if os.path.isdir(os.path.join(runs_base, d))
+                    and d.startswith("ssd_unified_")]
+            for d in sorted(dirs, reverse=True):
+                candidates.append(os.path.join(runs_base, d))
 
     return candidates
 
@@ -302,6 +392,26 @@ class MetricsCalculator:
         return results
 
 
+def _merge_calculators(calcs, iou_thresholds):
+    """Fusionne plusieurs MetricsCalculator en un seul en sommant TP/FP/FN."""
+    all_classes = []
+    seen = set()
+    for c in calcs:
+        for name in c.class_names:
+            if name not in seen:
+                all_classes.append(name)
+                seen.add(name)
+    merged = MetricsCalculator(['__background__'] + all_classes, iou_thresholds)
+    for calc in calcs:
+        for name in calc.class_names:
+            for t in iou_thresholds:
+                merged.tp[name][t] += calc.tp[name][t]
+                merged.fp[name][t] += calc.fp[name][t]
+                merged.fn[name][t] += calc.fn[name][t]
+        merged.all_ious.extend(calc.all_ious)
+    return merged
+
+
 def count_parameters(model):
     """Retourne le nombre de paramètres du modèle en millions."""
     return sum(p.numel() for p in model.parameters()) / 1e6
@@ -350,111 +460,15 @@ def plot_metrics(results, output_dir):
     plt.close()
 
 
-# =============================================================================
-# MAIN
-# =============================================================================
-
-def main():
-    parser = argparse.ArgumentParser(description="Evaluation SSD")
-    parser.add_argument(
-        "--mode", choices=["nadir", "oblique", "all"], default="all",
-        help="nadir / oblique / all (defaut: all)"
-    )
-    parser.add_argument("--model", default=None, help="Chemin direct vers le modele .pth")
-    args = parser.parse_args()
-    mode = args.mode
-
-    if mode == "nadir":
-        CONFIG["classes_file"] = CONFIG["nadir_classes_file"]
-    elif mode == "oblique":
-        CONFIG["classes_file"] = CONFIG["oblique_classes_file"]
-    CONFIG["classes"] = load_classes(CONFIG["classes_file"])
-    CONFIG["output_dir"] = os.path.join(CONFIG["output_dir"], mode)
-
-    print("=" * 70)
-    print(f"   EVALUATION SSD - TEST SET (10%) - Mode: {mode.upper()}")
-    print("=" * 70)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"   Device: {device}")
-
-    model_path = args.model or find_model(mode)
-    if model_path is None or not os.path.exists(model_path):
-        print(f"   Modele non trouve pour le mode '{mode}'.")
-        print("   Lancez : python train.py --mode " + mode)
-        return
-
-    model, classes, cat_mapping, model_name, image_size = load_model(model_path, device)
-
-    num_params = count_parameters(model)
-    print(f"   Parametres: {num_params:.2f}M")
-
-    test_info_path = find_test_info(mode)
-    if test_info_path is None:
-        print("   test_info.json non trouve! Lancez train.py --mode " + mode + " d'abord.")
-        return
-
-    print(f"   test_info: {test_info_path}")
-    with open(test_info_path, 'r') as f:
-        test_info = json.load(f)
-
-    images_dir       = test_info['images_dir']
-    annotations_file = test_info['annotations_file']
-    test_image_ids   = test_info['test_image_ids']
-    cat_mapping_int  = ({int(k): v for k, v in cat_mapping.items()}
-                        if cat_mapping else
-                        {int(k): v for k, v in test_info['cat_mapping'].items()})
-    eval_image_size  = test_info.get('image_size', image_size)
-
-    print(f"\n📋 Configuration:")
-    print(f"   Modèle:   {model_path} ({model_name})")
-    print(f"   Test set: {len(test_image_ids)} images")
-    print(f"   Classes:  {classes}")
-
-    os.makedirs(CONFIG["output_dir"], exist_ok=True)
-    test_dataset = TestDataset(images_dir, annotations_file, test_image_ids,
-                               cat_mapping_int, eval_image_size)
-    test_loader  = DataLoader(test_dataset, batch_size=1, shuffle=False,
-                              collate_fn=collate_fn, num_workers=0)
-
-    print("\n⚡ Benchmark inférence...")
-    infer_ms, fps_gpu = benchmark_inference(model, device, eval_image_size)
-    print(f"   Vitesse inférence: {infer_ms:.2f} ms/image")
-    print(f"   FPS GPU:           {fps_gpu:.1f}")
-
-    print("\n📊 Évaluation sur le TEST SET...")
-    calc = MetricsCalculator(classes, CONFIG["iou_thresholds"])
-
-    model.eval()
-    with torch.no_grad():
-        for images, targets in tqdm(test_loader, desc="Test"):
-            images  = list(img.to(device) for img in images)
-            outputs = model(images)
-            for output, target in zip(outputs, targets):
-                keep = output['scores'].cpu() >= CONFIG["score_threshold"]
-                pred_boxes  = output['boxes'].cpu().numpy()[keep.numpy()]
-                pred_labels = output['labels'].cpu().numpy()[keep.numpy()]
-                pred_scores = output['scores'].cpu().numpy()[keep.numpy()]
-                gt_boxes    = target['boxes'].numpy()
-                gt_labels   = target['labels'].numpy()
-                calc.add_image(pred_boxes, pred_labels, pred_scores, gt_boxes, gt_labels)
-
-    results = calc.compute()
-    results['evaluation_info'] = {
-        'dataset':         'TEST SET (10%)',
-        'num_images':      len(test_image_ids),
-        'model_path':      model_path,
-        'model_name':      model_name,
-        'timestamp':       datetime.now().isoformat(),
-        'params_M':        round(num_params, 2),
-        'infer_ms':        round(infer_ms, 2),
-        'fps_gpu':         round(fps_gpu, 1),
-    }
-
+def _print_save_results(results, output_dir, n_images, num_params, infer_ms, fps_gpu, model_path, model_name, label=""):
+    """Affiche et sauvegarde les résultats d'évaluation."""
+    title = f"RÉSULTATS SUR LE TEST SET{' — ' + label if label else ''}"
     print("\n" + "=" * 70)
-    print("   📊 RÉSULTATS SUR LE TEST SET")
+    print(f"   {title}")
     print("=" * 70)
-    print(f"   Images testées:          {len(test_image_ids)}")
-    print(f"   Paramètres (M):          {num_params:.2f}M")
+    print(f"   Images testées:          {n_images}")
+    if num_params:
+        print(f"   Paramètres (M):          {num_params:.2f}M")
     print(f"   Vitesse Inférence (ms↓): {infer_ms:.2f} ms/image")
     print(f"   FPS GPU:                 {fps_gpu:.1f}")
     print(f"   mAP@50:                  {results['mAP50']:.4f} ({results['mAP50']*100:.2f}%)")
@@ -469,14 +483,16 @@ def main():
             m = results['per_class'][name]['iou_0.5']
             print(f"   {name:<30} P={m['Precision']:.3f} R={m['Recall']:.3f} F1={m['F1']:.3f}")
 
-    with open(os.path.join(CONFIG["output_dir"], "metrics_test_set.json"), 'w') as f:
+    os.makedirs(output_dir, exist_ok=True)
+    with open(os.path.join(output_dir, "metrics_test_set.json"), 'w') as f:
         json.dump(results, f, indent=2, default=float)
-    plot_metrics(results, CONFIG["output_dir"])
+    plot_metrics(results, output_dir)
 
-    with open(os.path.join(CONFIG["output_dir"], "evaluation_report_test_set.txt"), 'w', encoding='utf-8') as f:
+    with open(os.path.join(output_dir, "evaluation_report_test_set.txt"), 'w', encoding='utf-8') as f:
         f.write(f"ÉVALUATION SSD ({model_name}) - TEST SET - {datetime.now()}\n{'='*50}\n\n")
-        f.write(f"Images testées: {len(test_image_ids)}\nModèle: {model_path}\n\n")
-        f.write(f"Paramètres (M):          {num_params:.2f}M\n")
+        f.write(f"Images testées: {n_images}\nModèle: {model_path}\n\n")
+        if num_params:
+            f.write(f"Paramètres (M):          {num_params:.2f}M\n")
         f.write(f"Vitesse Inférence (ms↓): {infer_ms:.2f} ms/image\n")
         f.write(f"FPS GPU:                 {fps_gpu:.1f}\n\n")
         f.write(f"mAP@50: {results['mAP50']:.4f} ({results['mAP50']*100:.2f}%)\n")
@@ -490,7 +506,199 @@ def main():
                 m = results['per_class'][name]['iou_0.5']
                 f.write(f"{name}: P={m['Precision']:.4f} R={m['Recall']:.4f} F1={m['F1']:.4f}\n")
 
-    print(f"\n📁 Résultats sauvegardés: {CONFIG['output_dir']}")
+    print(f"\n   Resultats sauvegardes: {output_dir}")
+
+
+# =============================================================================
+# HELPER D'ÉVALUATION
+# =============================================================================
+
+def _run_mode_evaluation(mode, model_path_override, device):
+    """
+    Charge le modele et evalue sur le test set pour un mode donne.
+    Retourne (calc, classes, model_name, model_path, num_params, infer_ms, fps, n_images)
+    ou None si le modele ou test_info est introuvable.
+    """
+    model_path = model_path_override or find_model(mode)
+    if model_path is None or not os.path.exists(model_path):
+        return None
+
+    model, classes, cat_mapping, model_name, image_size = load_model(model_path, device)
+    num_params = count_parameters(model)
+    print(f"   Parametres: {num_params:.2f}M")
+
+    test_info_path = find_test_info(mode)
+    if test_info_path is None:
+        print(f"   test_info.json introuvable pour le mode '{mode}'!")
+        return None
+
+    print(f"   test_info:  {test_info_path}")
+    with open(test_info_path, 'r') as f:
+        test_info = json.load(f)
+
+    images_dir       = test_info['images_dir']
+    annotations_file = test_info['annotations_file']
+    test_image_ids   = test_info['test_image_ids']
+    cat_mapping_int  = ({int(k): v for k, v in cat_mapping.items()}
+                        if cat_mapping else
+                        {int(k): v for k, v in test_info['cat_mapping'].items()})
+    eval_image_size  = test_info.get('image_size', image_size)
+
+    print(f"   Test set:   {len(test_image_ids)} images | Classes: {classes}")
+
+    print("   Benchmark inference...")
+    infer_ms, fps_gpu = benchmark_inference(model, device, eval_image_size)
+    print(f"   Vitesse: {infer_ms:.2f} ms/image  |  FPS: {fps_gpu:.1f}")
+
+    test_dataset = TestDataset(images_dir, annotations_file, test_image_ids,
+                               cat_mapping_int, eval_image_size)
+    test_loader  = DataLoader(test_dataset, batch_size=1, shuffle=False,
+                              collate_fn=collate_fn, num_workers=0)
+
+    calc = MetricsCalculator(classes, CONFIG["iou_thresholds"])
+    model.eval()
+    with torch.no_grad():
+        for images, targets in tqdm(test_loader, desc=f"Eval {mode}"):
+            images  = list(img.to(device) for img in images)
+            outputs = model(images)
+            for output, target in zip(outputs, targets):
+                keep        = output['scores'].cpu() >= CONFIG["score_threshold"]
+                pred_boxes  = output['boxes'].cpu().numpy()[keep.numpy()]
+                pred_labels = output['labels'].cpu().numpy()[keep.numpy()]
+                pred_scores = output['scores'].cpu().numpy()[keep.numpy()]
+                gt_boxes    = target['boxes'].numpy()
+                gt_labels   = target['labels'].numpy()
+                calc.add_image(pred_boxes, pred_labels, pred_scores, gt_boxes, gt_labels)
+
+    return calc, classes, model_name, model_path, num_params, infer_ms, fps_gpu, len(test_image_ids)
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(description="Evaluation SSD")
+    parser.add_argument(
+        "--mode", choices=["nadir", "oblique", "all"], default="all",
+        help="nadir / oblique / all (defaut: all)"
+    )
+    parser.add_argument("--model", default=None, help="Chemin direct vers le modele .pth")
+    args = parser.parse_args()
+    mode = args.mode
+
+    print("=" * 70)
+    print(f"   EVALUATION SSD - TEST SET (10%) - Mode: {mode.upper()}")
+    print("=" * 70)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"   Device: {device}")
+
+    # -------------------------------------------------------------------------
+    # Mode "all" sans modèle explicite : évaluer nadir + oblique et fusionner
+    # -------------------------------------------------------------------------
+    if mode == "all" and args.model is None and find_model("all") is None:
+        print("\n   Aucun modele unifie trouve → evaluation nadir + oblique\n")
+
+        collected = []
+
+        for sub_mode in ("nadir", "oblique"):
+            cf = (CONFIG["nadir_classes_file"] if sub_mode == "nadir"
+                  else CONFIG["oblique_classes_file"])
+            CONFIG["classes"] = load_classes(cf)
+
+            print(f"\n{'─'*50}")
+            print(f"   [{sub_mode.upper()}]")
+            print(f"{'─'*50}")
+
+            ret = _run_mode_evaluation(sub_mode, None, device)
+            if ret is None:
+                print(f"   Mode {sub_mode} ignore (modele ou test_info introuvable).")
+                continue
+
+            calc, classes, model_name, model_path, num_params, infer_ms, fps, n_imgs = ret
+            collected.append({
+                'calc': calc, 'classes': classes, 'model_name': model_name,
+                'model_path': model_path, 'num_params': num_params,
+                'infer_ms': infer_ms, 'fps': fps, 'n_images': n_imgs,
+                'mode': sub_mode,
+            })
+
+        if not collected:
+            print("\n   Aucun modele trouve pour nadir ni oblique.")
+            print("   Lancez : python train_unified.py --mode nadir")
+            print("            python train_unified.py --mode oblique")
+            return
+
+        # Fusionner les métriques
+        merged_calc = _merge_calculators(
+            [r['calc'] for r in collected], CONFIG["iou_thresholds"])
+        results = merged_calc.compute()
+
+        modes_done   = [r['mode'] for r in collected]
+        total_images = sum(r['n_images'] for r in collected)
+        avg_infer_ms = sum(r['infer_ms'] for r in collected) / len(collected)
+        avg_fps      = sum(r['fps']      for r in collected) / len(collected)
+        total_params = sum(r['num_params'] for r in collected)
+        model_paths  = " + ".join(r['model_path'] for r in collected)
+        model_names  = " + ".join(r['model_name'] for r in collected)
+
+        results['evaluation_info'] = {
+            'dataset':    f"TEST SET (10%) — {' + '.join(modes_done)}",
+            'num_images': total_images,
+            'model_path': model_paths,
+            'model_name': model_names,
+            'timestamp':  datetime.now().isoformat(),
+            'params_M':   round(total_params, 2),
+            'infer_ms':   round(avg_infer_ms, 2),
+            'fps_gpu':    round(avg_fps, 1),
+        }
+
+        out_dir = os.path.join(CONFIG["output_dir"], "global")
+        _print_save_results(
+            results, out_dir,
+            n_images=total_images, num_params=total_params,
+            infer_ms=avg_infer_ms, fps_gpu=avg_fps,
+            model_path=model_paths, model_name=model_names,
+            label="GLOBAL (NADIR + OBLIQUE)",
+        )
+        return
+
+    # -------------------------------------------------------------------------
+    # Mode single : nadir, oblique, ou all avec un modèle unifié
+    # -------------------------------------------------------------------------
+    if mode == "nadir":
+        CONFIG["classes_file"] = CONFIG["nadir_classes_file"]
+    elif mode == "oblique":
+        CONFIG["classes_file"] = CONFIG["oblique_classes_file"]
+    CONFIG["classes"] = load_classes(CONFIG["classes_file"])
+
+    out_dir = os.path.join(CONFIG["output_dir"], mode)
+
+    ret = _run_mode_evaluation(mode, args.model, device)
+    if ret is None:
+        print(f"\n   Modele non trouve pour le mode '{mode}'.")
+        print("   Lancez : python train_unified.py --mode " + mode)
+        return
+
+    calc, classes, model_name, model_path, num_params, infer_ms, fps_gpu, n_images = ret
+    results = calc.compute()
+    results['evaluation_info'] = {
+        'dataset':    'TEST SET (10%)',
+        'num_images': n_images,
+        'model_path': model_path,
+        'model_name': model_name,
+        'timestamp':  datetime.now().isoformat(),
+        'params_M':   round(num_params, 2),
+        'infer_ms':   round(infer_ms, 2),
+        'fps_gpu':    round(fps_gpu, 1),
+    }
+
+    _print_save_results(
+        results, out_dir,
+        n_images=n_images, num_params=num_params,
+        infer_ms=infer_ms, fps_gpu=fps_gpu,
+        model_path=model_path, model_name=model_name,
+    )
 
 
 if __name__ == "__main__":

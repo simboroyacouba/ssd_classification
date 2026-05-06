@@ -26,6 +26,7 @@ import json
 import yaml
 import shutil
 import argparse
+import random
 import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
@@ -256,11 +257,6 @@ class SSDDataset(Dataset):
         scale_x = self.image_size / orig_w
         scale_y = self.image_size / orig_h
 
-        image_tensor = TF.to_tensor(image)
-        image_tensor = TF.normalize(image_tensor,
-                                    mean=[0.485, 0.456, 0.406],
-                                    std=[0.229, 0.224, 0.225])
-
         anns   = self.coco.loadAnns(self.coco.getAnnIds(imgIds=img_id))
         boxes  = []
         labels = []
@@ -281,6 +277,25 @@ class SSDDataset(Dataset):
             if x2 > x1 and y2 > y1:
                 boxes.append([x1, y1, x2, y2])
                 labels.append(class_id)
+
+        if self.augment:
+            # Flip horizontal (boites ajustees)
+            if random.random() < 0.5:
+                image = TF.hflip(image)
+                boxes = [[self.image_size - x2, y1, self.image_size - x1, y2]
+                         for x1, y1, x2, y2 in boxes]
+            # Color jitter
+            if random.random() < 0.5:
+                image = TF.adjust_brightness(image, random.uniform(0.7, 1.3))
+            if random.random() < 0.5:
+                image = TF.adjust_contrast(image, random.uniform(0.7, 1.3))
+            if random.random() < 0.5:
+                image = TF.adjust_saturation(image, random.uniform(0.7, 1.3))
+
+        image_tensor = TF.to_tensor(image)
+        image_tensor = TF.normalize(image_tensor,
+                                    mean=[0.485, 0.456, 0.406],
+                                    std=[0.229, 0.224, 0.225])
 
         target = {
             'boxes':    torch.tensor(boxes,  dtype=torch.float32) if boxes  else torch.zeros((0, 4), dtype=torch.float32),

@@ -40,6 +40,77 @@ IOU_THRESHOLDS = [round(t, 2) for t in np.arange(0.5, 1.0, 0.05)]
 
 
 # =============================================================================
+# MODULES D'ATTENTION (miroir de train_unified.py)
+# =============================================================================
+
+class ChannelAttention(torch.nn.Module):
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        mid = max(channels // reduction, 4)
+        self.avg_pool = torch.nn.AdaptiveAvgPool2d(1)
+        self.max_pool = torch.nn.AdaptiveMaxPool2d(1)
+        self.fc = torch.nn.Sequential(
+            torch.nn.Conv2d(channels, mid, 1, bias=False),
+            torch.nn.ReLU(inplace=True),
+            torch.nn.Conv2d(mid, channels, 1, bias=False),
+        )
+        self.sigmoid = torch.nn.Sigmoid()
+
+    def forward(self, x):
+        return x * self.sigmoid(self.fc(self.avg_pool(x)) + self.fc(self.max_pool(x)))
+
+
+class SpatialAttention(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv    = torch.nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False)
+        self.sigmoid = torch.nn.Sigmoid()
+
+    def forward(self, x):
+        avg = x.mean(dim=1, keepdim=True)
+        mx, _ = x.max(dim=1, keepdim=True)
+        return x * self.sigmoid(self.conv(torch.cat([avg, mx], dim=1)))
+
+
+class CBAM(torch.nn.Module):
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.ca = ChannelAttention(channels, reduction)
+        self.sa = SpatialAttention()
+
+    def forward(self, x):
+        return self.sa(self.ca(x))
+
+
+class AttentionBackbone(torch.nn.Module):
+    def __init__(self, backbone, channels, attention_type):
+        super().__init__()
+        self.backbone = backbone
+        if attention_type == 'se':
+            self.attentions = torch.nn.ModuleList([ChannelAttention(c) for c in channels])
+        elif attention_type == 'cbam':
+            self.attentions = torch.nn.ModuleList([CBAM(c) for c in channels])
+        else:
+            self.attentions = torch.nn.ModuleList([torch.nn.Identity() for _ in channels])
+
+    def forward(self, x):
+        features = self.backbone(x)
+        result = {}
+        for i, (k, v) in enumerate(features.items()):
+            attn = self.attentions[i] if i < len(self.attentions) else torch.nn.Identity()
+            result[k] = attn(v)
+        return result
+
+
+def _probe_backbone_channels(backbone, image_size):
+    backbone.eval()
+    with torch.no_grad():
+        dummy = torch.zeros(1, 3, image_size, image_size)
+        feats = backbone(dummy)
+    return [f.shape[1] for f in feats.values()]
+
+
+# =============================================================================
 # AUTODÉCOUVERTE
 # =============================================================================
 
@@ -83,7 +154,7 @@ def find_unified_model_and_test_info(output_base=None):
 # MODÈLE
 # =============================================================================
 
-def build_model(model_name, num_classes):
+def build_model(model_name, num_classes, attention_type=None, image_size=300):
     if model_name == "ssd300_vgg16":
         model = ssd300_vgg16(weights=None)
         in_channels = [512, 1024, 512, 256, 256, 256]
@@ -102,27 +173,38 @@ def build_model(model_name, num_classes):
             in_channels=in_channels, num_anchors=num_anchors, num_classes=num_classes)
     else:
         raise ValueError(f"Modele inconnu: {model_name}")
+
+    if attention_type and attention_type != 'none':
+        channels = _probe_backbone_channels(model.backbone, image_size)
+        model.backbone = AttentionBackbone(model.backbone, channels, attention_type)
+
     return model
 
 
 def load_model(model_path, device):
     print(f"   Chargement: {model_path}")
-    ckpt        = torch.load(model_path, map_location=device)
-    num_classes = ckpt.get("num_classes", 6)
-    classes     = ckpt.get("classes", [])
-    model_name  = ckpt.get("model_name", "ssd300_vgg16")
-    image_size  = ckpt.get("image_size", 300)
-    cat_mapping = ckpt.get("cat_mapping", {})
+    ckpt           = torch.load(model_path, map_location=device, weights_only=False)
+    num_classes    = ckpt.get("num_classes", 6)
+    classes        = ckpt.get("classes", [])
+    model_name     = ckpt.get("model_name", "ssd300_vgg16")
+    image_size     = ckpt.get("image_size", 300)
+    cat_mapping    = ckpt.get("cat_mapping", {})
+    attention_type = ckpt.get("attention", None)
 
-    model = build_model(model_name, num_classes)
-    model.load_state_dict(ckpt["model_state_dict"])
+    model = build_model(model_name, num_classes, attention_type, image_size)
+    missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    if unexpected:
+        print(f"   [WARN] Clés inattendues ignorées: {len(unexpected)}")
+    if missing:
+        print(f"   [WARN] Clés manquantes: {len(missing)}")
     model.to(device)
     model.eval()
 
     epoch = ckpt.get("epoch", "?")
     map50 = ckpt.get("map50", 0)
+    attn_info = f" | Attention: {attention_type}" if attention_type and attention_type != 'none' else ""
     print(f"   Epoch {epoch} | mAP@50 (val) = {map50:.4f}")
-    print(f"   Modele: {model_name} | Image: {image_size}px | Classes: {classes}")
+    print(f"   Modele: {model_name} | Image: {image_size}px{attn_info} | Classes: {classes}")
     return model, classes, model_name, image_size, cat_mapping
 
 

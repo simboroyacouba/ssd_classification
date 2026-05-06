@@ -74,6 +74,7 @@ def build_config(args):
         "score_threshold":  args.score_threshold,
         "pretrained":       not args.no_pretrained,
         "attention":        args.attention,
+        "augment":          args.augment,
         "grad_clip":        args.grad_clip,
         "class_weights":    args.class_weights,
     }
@@ -160,17 +161,90 @@ def print_split_stats(coco, stats):
 
 
 # =============================================================================
-# DATASET
+# DATASET + AUGMENTATION
 # =============================================================================
+
+import random as _random
+import torchvision.transforms as T
+
+
+class SSDaugmenter:
+    """
+    Pipeline d'augmentation SSD avec adaptation des bounding boxes.
+    Toutes les transformations géométriques ajustent les boîtes.
+    """
+
+    def __init__(self,
+                 flip_prob=0.5,
+                 color_jitter_prob=0.5,
+                 expand_prob=0.5,
+                 expand_max_ratio=3.0,
+                 brightness=0.3,
+                 contrast=0.3,
+                 saturation=0.3,
+                 hue=0.1):
+        self.flip_prob         = flip_prob
+        self.color_jitter_prob = color_jitter_prob
+        self.expand_prob       = expand_prob
+        self.expand_max_ratio  = expand_max_ratio
+        self.jitter = T.ColorJitter(brightness=brightness, contrast=contrast,
+                                    saturation=saturation, hue=hue)
+
+    def __call__(self, image, boxes):
+        """
+        image : PIL Image (après resize vers image_size)
+        boxes : list of [x1,y1,x2,y2] en pixels dans image_size
+        Retourne (image PIL, boxes list)
+        """
+        W, H = image.size
+
+        # 1. Zoom out (expand) : ajoute du fond autour de l'image
+        if boxes and _random.random() < self.expand_prob:
+            ratio  = _random.uniform(1.0, self.expand_max_ratio)
+            new_W  = int(W * ratio)
+            new_H  = int(H * ratio)
+            off_x  = _random.randint(0, new_W - W)
+            off_y  = _random.randint(0, new_H - H)
+            # fond = couleur moyenne de normalisation (gris ~128)
+            canvas = Image.new("RGB", (new_W, new_H), (123, 117, 104))
+            canvas.paste(image, (off_x, off_y))
+            image  = canvas.resize((W, H), Image.BILINEAR)
+            # ajuster les boîtes : scale + offset
+            sx = W / new_W; sy = H / new_H
+            boxes = [
+                [(b[0] + off_x) * sx, (b[1] + off_y) * sy,
+                 (b[2] + off_x) * sx, (b[3] + off_y) * sy]
+                for b in boxes
+            ]
+
+        # 2. Retournement horizontal
+        if _random.random() < self.flip_prob:
+            image = TF.hflip(image)
+            boxes = [[W - b[2], b[1], W - b[0], b[3]] for b in boxes]
+
+        # 3. Distorsion photométrique (couleur uniquement, pas de géométrie)
+        if _random.random() < self.color_jitter_prob:
+            image = self.jitter(image)
+
+        # 4. Nettoyer les boîtes dégénérées
+        boxes = [
+            [max(0.0, b[0]), max(0.0, b[1]),
+             min(float(W), b[2]), min(float(H), b[3])]
+            for b in boxes
+            if b[2] > b[0] + 1 and b[3] > b[1] + 1
+        ]
+        return image, boxes
+
 
 class SSDDataset(Dataset):
     def __init__(self, images_dir, annotations_file, image_ids,
-                 cat_mapping, image_size=300):
+                 cat_mapping, image_size=300, augment=False):
         self.images_dir  = images_dir
         self.coco        = COCO(annotations_file)
         self.image_ids   = image_ids
         self.cat_mapping = cat_mapping
         self.image_size  = image_size
+        self.augmenter   = SSDaugmenter() if augment else None
 
     def __len__(self):
         return len(self.image_ids)
@@ -185,10 +259,6 @@ class SSDDataset(Dataset):
         image    = image.resize((self.image_size, self.image_size))
         scale_x  = self.image_size / orig_w
         scale_y  = self.image_size / orig_h
-
-        tensor = TF.to_tensor(image)
-        tensor = TF.normalize(tensor, mean=[0.485, 0.456, 0.406],
-                                       std=[0.229, 0.224, 0.225])
 
         anns   = self.coco.loadAnns(self.coco.getAnnIds(imgIds=img_id))
         boxes, labels = [], []
@@ -208,6 +278,14 @@ class SSDDataset(Dataset):
             if x2 > x1 and y2 > y1:
                 boxes.append([x1, y1, x2, y2])
                 labels.append(class_id)
+
+        # Augmentation (train uniquement)
+        if self.augmenter is not None and boxes:
+            image, boxes = self.augmenter(image, boxes)
+
+        tensor = TF.to_tensor(image)
+        tensor = TF.normalize(tensor, mean=[0.485, 0.456, 0.406],
+                                       std=[0.229, 0.224, 0.225])
 
         target = {
             'boxes':    torch.tensor(boxes,  dtype=torch.float32) if boxes  else torch.zeros((0, 4), dtype=torch.float32),
@@ -512,6 +590,8 @@ def main():
     parser.add_argument("--attention",        default=os.getenv("ATTENTION", "none"),
                         choices=["none", "se", "cbam"],
                         help="Mecanisme d'attention sur les feature maps du backbone (none/se/cbam)")
+    parser.add_argument("--augment",          action="store_true", default=os.getenv("AUGMENT","0")=="1",
+                        help="Activer l'augmentation (flip, color jitter, zoom out)")
     parser.add_argument("--class-weights",    action="store_true", default=os.getenv("CLASS_WEIGHTS","0")=="1",
                         help="Activer le surechantillonnage pondéré par classe (classes rares favorisees)")
     args = parser.parse_args()
@@ -571,9 +651,13 @@ def main():
         json.dump(test_info, f, indent=2)
 
     train_dataset = SSDDataset(config["images_dir"], config["annotations_file"],
-                               train_ids, cat_mapping, image_size)
+                               train_ids, cat_mapping, image_size,
+                               augment=config["augment"])
     val_dataset   = SSDDataset(config["images_dir"], config["annotations_file"],
-                               val_ids,   cat_mapping, image_size)
+                               val_ids,   cat_mapping, image_size,
+                               augment=False)
+    if config["augment"]:
+        print("   Augmentation activee : flip | color jitter | zoom out")
     if config["class_weights"]:
         sampler = build_class_weighted_sampler(train_dataset, coco, cat_mapping, class_names_no_bg)
         train_loader = DataLoader(train_dataset, batch_size=config["batch_size"],
@@ -640,6 +724,7 @@ def main():
                 'map50': best_map50, 'num_classes': num_classes,
                 'classes': classes, 'cat_mapping': cat_mapping,
                 'model_name': config["model_name"], 'image_size': image_size,
+                'attention': config["attention"],
             }, best_path)
             print(f"   Meilleur modele sauvegarde (mAP@50: {best_map50:.4f})")
 
@@ -650,6 +735,7 @@ def main():
                 'map50': val_map50, 'num_classes': num_classes,
                 'classes': classes, 'cat_mapping': cat_mapping,
                 'model_name': config["model_name"], 'image_size': image_size,
+                'attention': config["attention"],
             }, os.path.join(weights_dir, "last.pth"))
 
     total_time = time.time() - start_time
