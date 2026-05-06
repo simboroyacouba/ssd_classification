@@ -77,6 +77,7 @@ def build_config(args):
         "augment":          args.augment,
         "grad_clip":        args.grad_clip,
         "class_weights":    args.class_weights,
+        "freeze_backbone":  args.freeze_backbone,
     }
 
 
@@ -594,6 +595,8 @@ def main():
                         help="Activer l'augmentation (flip, color jitter, zoom out)")
     parser.add_argument("--class-weights",    action="store_true", default=os.getenv("CLASS_WEIGHTS","0")=="1",
                         help="Activer le surechantillonnage pondéré par classe (classes rares favorisees)")
+    parser.add_argument("--freeze-backbone",  action="store_true", default=os.getenv("FREEZE_BACKBONE","0")=="1",
+                        help="Gele le backbone, entraine uniquement la tete de detection (fine-tuning rapide)")
     args = parser.parse_args()
 
     config     = build_config(args)
@@ -674,6 +677,14 @@ def main():
     model = build_model(config["model_name"], num_classes, config["pretrained"],
                         config["attention"], image_size)
     model.to(device)
+
+    if config["freeze_backbone"]:
+        for param in model.backbone.parameters():
+            param.requires_grad = False
+        n_frozen    = sum(p.numel() for p in model.backbone.parameters())
+        n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"   Backbone gele : {n_frozen/1e6:.2f}M params figes")
+        print(f"   Parametres entraines (tete seule) : {n_trainable/1e6:.2f}M")
 
     params       = [p for p in model.parameters() if p.requires_grad]
     optimizer    = torch.optim.SGD(params, lr=config["learning_rate"],
