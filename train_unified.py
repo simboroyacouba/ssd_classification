@@ -24,7 +24,7 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 import time
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 import torchvision.transforms.functional as TF
 from torchvision.models.detection import (
     ssd300_vgg16, SSD300_VGG16_Weights,
@@ -74,6 +74,7 @@ def build_config(args):
         "score_threshold":  args.score_threshold,
         "pretrained":       not args.no_pretrained,
         "grad_clip":        args.grad_clip,
+        "class_weights":    args.class_weights,
     }
 
 
@@ -307,6 +308,47 @@ def compute_map(predictions, ground_truths, class_names, iou_threshold=0.5):
 
 
 # =============================================================================
+# PONDÉRATION DES CLASSES (class-balanced sampler)
+# =============================================================================
+
+def build_class_weighted_sampler(dataset, coco, cat_mapping, class_names_no_bg):
+    """WeightedRandomSampler : sur-échantillonne les images avec des classes rares."""
+    num_classes = len(class_names_no_bg)
+
+    # Fréquence globale de chaque classe (nombre d'annotations dans le train set)
+    class_counts = np.zeros(num_classes + 1, dtype=np.float32)  # index 1..num_classes
+    for img_id in dataset.image_ids:
+        anns = coco.loadAnns(coco.getAnnIds(imgIds=img_id))
+        for ann in anns:
+            cls_idx = cat_mapping.get(ann['category_id'])
+            if cls_idx is not None and 1 <= cls_idx <= num_classes:
+                class_counts[cls_idx] += 1
+
+    # Poids inverse de fréquence par classe (classes rares → poids élevé)
+    class_counts = np.maximum(class_counts, 1)
+    class_weights = 1.0 / class_counts
+
+    # Poids de chaque image = max poids parmi toutes ses classes
+    sample_weights = []
+    for img_id in dataset.image_ids:
+        anns = coco.loadAnns(coco.getAnnIds(imgIds=img_id))
+        img_w = 0.0
+        for ann in anns:
+            cls_idx = cat_mapping.get(ann['category_id'])
+            if cls_idx is not None and 1 <= cls_idx <= num_classes:
+                img_w = max(img_w, class_weights[cls_idx])
+        sample_weights.append(max(img_w, 1e-6))
+
+    sample_weights = torch.tensor(sample_weights, dtype=torch.float32)
+
+    print("   Poids d'echantillonnage par classe :")
+    for i, name in enumerate(class_names_no_bg, start=1):
+        print(f"      {name:<30} count={int(class_counts[i])}  weight={class_weights[i]:.4f}")
+
+    return WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
+
+
+# =============================================================================
 # ENTRAÎNEMENT
 # =============================================================================
 
@@ -384,6 +426,8 @@ def main():
     parser.add_argument("--score-threshold",  type=float, default=float(os.getenv("SCORE_THRESHOLD", "0.3")))
     parser.add_argument("--grad-clip",        type=float, default=float(os.getenv("GRAD_CLIP",   "1.0")))
     parser.add_argument("--no-pretrained",    action="store_true")
+    parser.add_argument("--class-weights",    action="store_true", default=os.getenv("CLASS_WEIGHTS","0")=="1",
+                        help="Activer le surechantillonnage pondéré par classe (classes rares favorisees)")
     args = parser.parse_args()
 
     config     = build_config(args)
@@ -444,8 +488,14 @@ def main():
                                train_ids, cat_mapping, image_size)
     val_dataset   = SSDDataset(config["images_dir"], config["annotations_file"],
                                val_ids,   cat_mapping, image_size)
-    train_loader  = DataLoader(train_dataset, batch_size=config["batch_size"],
-                               shuffle=True,  collate_fn=collate_fn, num_workers=0)
+    if config["class_weights"]:
+        sampler = build_class_weighted_sampler(train_dataset, coco, cat_mapping, class_names_no_bg)
+        train_loader = DataLoader(train_dataset, batch_size=config["batch_size"],
+                                  sampler=sampler, collate_fn=collate_fn, num_workers=0)
+        print("   Mode: surechantillonnage pondéré par classe activé")
+    else:
+        train_loader = DataLoader(train_dataset, batch_size=config["batch_size"],
+                                  shuffle=True,  collate_fn=collate_fn, num_workers=0)
     val_loader    = DataLoader(val_dataset,   batch_size=1,
                                shuffle=False, collate_fn=collate_fn, num_workers=0)
     print(f"\n   Train: {len(train_dataset)} | Val: {len(val_dataset)} | Test: {len(test_ids)} images")
