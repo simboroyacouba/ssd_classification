@@ -259,12 +259,34 @@ def generate_summary(reports, output_dir, total_time, classes):
 # MAIN
 # =============================================================================
 
+def _auto_find_input():
+    for candidate in (
+        os.getenv("DETECTION_INFERENCE_IMAGES_DIR", ""),
+        "./test_images",
+        "./images",
+        "../test",
+    ):
+        if candidate and os.path.isdir(candidate):
+            return candidate
+    return None
+
+
+def _auto_find_model():
+    mp = find_best_model("all")
+    if mp:
+        return mp
+    for sub in ("nadir", "oblique"):
+        mp = find_best_model(sub)
+        if mp:
+            return mp
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser(description="Inference SSD")
-    parser.add_argument("--mode",       choices=["nadir", "oblique", "all"], default="all",
-                        help="nadir / oblique / all (defaut: all)")
     parser.add_argument("--model",      default=None)
-    parser.add_argument("--input",      default=os.getenv("DETECTION_INFERENCE_IMAGES_DIR", None))
+    parser.add_argument("--input",      default=None,
+                        help="Dossier ou image (defaut: auto-detection)")
     parser.add_argument("--output",     default=os.getenv("PREDICTIONS_DIR", "./predictions"))
     parser.add_argument("--threshold",  type=float, default=float(os.getenv("SCORE_THRESHOLD", "0.3")))
     parser.add_argument("--no-display", action="store_true")
@@ -274,10 +296,17 @@ def main():
     print(f"   Device: {device}")
 
     if args.model is None:
-        args.model = find_best_model(args.mode)
+        args.model = _auto_find_model()
     if args.model is None or not os.path.exists(args.model):
-        print(f"   Modele non trouve pour le mode '{args.mode}'.")
-        print("   Lancez : python train.py --mode " + args.mode)
+        print("   Modele non trouve. Lancez : python train.py --mode simple|attention|optimize|dual")
+        return
+
+    if args.input is None:
+        args.input = _auto_find_input()
+    if args.input is None:
+        print("   Aucun dossier d'images trouve.")
+        print("   Utilisez : python inference.py --input /chemin/vers/images")
+        print("   Ou definir DETECTION_INFERENCE_IMAGES_DIR dans .env")
         return
 
     model, classes, model_name, image_size = load_model(args.model, device)
