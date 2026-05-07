@@ -2,12 +2,11 @@
 Entraînement SSD pour détection des toitures cadastrales
 Dataset: Images aériennes annotées avec CVAT (format COCO)
 Classes: Chargées depuis classes.yaml
-Configuration: Chargée depuis .env
 
 Architecture duale :
-  - Modele nadir   : classe panneau_solaire   (Production_*.png)
-  - Modele oblique : classes batiment_*        (Snapshot_*.jpg)
-  - Modele all     : toutes les classes
+  - Mode nadir   : classe panneau_solaire   (instances_nadir.json)
+  - Mode oblique : classes batiment_*        (instances_oblique.json)
+  - Mode dual    : nadir puis oblique séquentiellement
 
 Backbone: VGG16 ou MobileNetV3 via torchvision
 Variantes disponibles:
@@ -15,13 +14,15 @@ Variantes disponibles:
   ssdlite320_mobilenet_v3_large   -> 320px, backbone MobileNetV3, léger/rapide
 
 Usage :
-  python train.py --mode nadir
-  python train.py --mode oblique
-  python train.py --mode all
-  python train.py --mode oblique --model-name ssdlite320_mobilenet_v3_large
+  python train.py --mode simple
+  python train.py --mode attention --cbam-reduction 16
+  python train.py --mode optimize --n-trials 30
+  python train.py --mode dual --aug panneau_solaire:3
+  python train.py --mode dual --model-name ssdlite320_mobilenet_v3_large
 """
 
 import os
+import copy
 import json
 import yaml
 import shutil
@@ -35,7 +36,7 @@ import time
 import gc
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 import torchvision.transforms.functional as TF
 from torchvision.models.detection import (
     ssd300_vgg16, SSD300_VGG16_Weights,
@@ -63,25 +64,19 @@ MODE_CLASSES = {
         "batiment_peint", "batiment_non_enduit",
         "batiment_enduit", "menuiserie_metallique",
     ],
-    "all": [
-        "panneau_solaire",
-        "batiment_peint", "batiment_non_enduit",
-        "batiment_enduit", "menuiserie_metallique",
-    ],
-}
-
-# Poids d'oversampling pour le mode oblique (via WeightedRandomSampler)
-OVERSAMPLE_WEIGHTS_OBLIQUE = {
-    "batiment_peint":        1,
-    "batiment_non_enduit":   1,
-    "batiment_enduit":       1,
-    "menuiserie_metallique": 1,
 }
 
 # Tailles d'image fixes par variante SSD
 SSD_IMAGE_SIZES = {
     "ssd300_vgg16":                   300,
     "ssdlite320_mobilenet_v3_large":  320,
+}
+
+OPTUNA_CONFIG = {
+    "n_trials":        30,
+    "n_epochs_per_trial": 5,
+    "study_name":      "ssd_cadastral",
+    "output_dir":      "./optuna_output",
 }
 
 
@@ -95,32 +90,17 @@ def build_config(args):
         "../dataset1/annotations/instances_default.json",
     )
     ann_dir = os.path.dirname(os.path.abspath(base_annotations))
-    mode    = args.mode
 
-    if args.annotations_file:
-        annotations_file = args.annotations_file
-    elif mode == "nadir":
-        annotations_file = os.path.join(ann_dir, "instances_nadir.json")
-    elif mode == "oblique":
-        annotations_file = os.path.join(ann_dir, "instances_oblique.json")
-    else:
-        annotations_file = base_annotations
-
-    base_output = os.getenv("OUTPUT_DIR", "./output")
-    if args.output_dir:
-        output_dir = args.output_dir
-    elif mode in ("nadir", "oblique"):
-        output_dir = os.path.join(base_output, mode)
-    else:
-        output_dir = base_output
-
-    # SSD n'a qu'un seul classes.yaml — le filtrage par mode se fait via MODE_CLASSES
-    classes_file = args.classes_file or os.getenv("CLASSES_FILE", "classes.yaml")
+    annotations_file = args.annotations_file or base_annotations
+    base_output      = os.getenv("OUTPUT_DIR", "./output")
+    output_dir       = args.output_dir or base_output
+    classes_file     = args.classes_file or os.getenv("CLASSES_FILE", "classes.yaml")
 
     return {
-        "mode":             mode,
+        "mode":             args.mode,
         "images_dir":       args.images_dir or os.getenv("DETECTION_DATASET_IMAGES_DIR", "../dataset1/images/default"),
         "annotations_file": annotations_file,
+        "ann_dir":          ann_dir,
         "output_dir":       output_dir,
         "classes_file":     classes_file,
         "model_name":       args.model_name or os.getenv("SSD_MODEL", "ssd300_vgg16"),
@@ -140,24 +120,75 @@ def build_config(args):
     }
 
 
+def _build_sub_config(base_config, mode_label):
+    """Construit un sous-config nadir ou oblique depuis le config de base."""
+    ann_dir = base_config["ann_dir"]
+    cfg = copy.deepcopy(base_config)
+    cfg["mode"] = mode_label
+    if mode_label == "nadir":
+        cfg["annotations_file"] = os.path.join(ann_dir, "instances_nadir.json")
+        cfg["output_dir"]       = os.path.join(base_config["output_dir"], "nadir")
+    elif mode_label == "oblique":
+        cfg["annotations_file"] = os.path.join(ann_dir, "instances_oblique.json")
+        cfg["output_dir"]       = os.path.join(base_config["output_dir"], "oblique")
+    return cfg
+
+
 # =============================================================================
 # CHARGEMENT DES CLASSES
 # =============================================================================
 
-def load_classes(yaml_path, mode="all"):
+def load_classes(yaml_path, mode_classes=None):
     if not os.path.exists(yaml_path):
         raise FileNotFoundError(f"Fichier introuvable: {yaml_path}")
     with open(yaml_path, 'r', encoding='utf-8') as f:
         data = yaml.safe_load(f)
     all_classes = [c for c in data.get('classes', []) if c != '__background__']
-    expected    = MODE_CLASSES.get(mode, all_classes)
-    filtered    = [c for c in all_classes if c in expected]
-    classes     = ['__background__'] + filtered
-
-    print(f"Classes ({mode}) depuis {yaml_path}:")
+    if mode_classes is not None:
+        filtered = [c for c in all_classes if c in mode_classes]
+    else:
+        filtered = all_classes
+    classes = ['__background__'] + filtered
+    print("Classes chargees:")
     for i, c in enumerate(classes):
         print(f"   [{i}] {c}")
     return classes
+
+
+# =============================================================================
+# PARSE AUG COEFFICIENTS
+# =============================================================================
+
+def parse_aug_coeffs(aug_args, classes):
+    """
+    Analyse --aug CLASS:COEFF avec correspondance partielle insensible à la casse.
+    Retourne un dict {class_name: coeff} pour les classes connues.
+    Exemple: ['batiment_peint:3', 'solaire:2']
+    """
+    coeffs = {}
+    for entry in (aug_args or []):
+        if ':' not in entry:
+            print(f"   [WARN] --aug '{entry}' ignoré (format attendu CLASS:COEFF)")
+            continue
+        raw_name, raw_coeff = entry.rsplit(':', 1)
+        try:
+            coeff = int(raw_coeff)
+        except ValueError:
+            print(f"   [WARN] --aug '{entry}' ignoré (coefficient non entier)")
+            continue
+        if coeff < 1:
+            print(f"   [WARN] --aug '{entry}' ignoré (coefficient < 1)")
+            continue
+        raw_lower = raw_name.lower()
+        matched = [c for c in classes if raw_lower in c.lower()]
+        if not matched:
+            print(f"   [WARN] --aug '{raw_name}' ne correspond à aucune classe connue")
+            continue
+        if len(matched) > 1:
+            print(f"   [WARN] --aug '{raw_name}' ambigu ({matched}), ignoré")
+            continue
+        coeffs[matched[0]] = coeff
+    return coeffs
 
 
 # =============================================================================
@@ -279,12 +310,10 @@ class SSDDataset(Dataset):
                 labels.append(class_id)
 
         if self.augment:
-            # Flip horizontal (boites ajustees)
             if random.random() < 0.5:
                 image = TF.hflip(image)
                 boxes = [[self.image_size - x2, y1, self.image_size - x1, y2]
                          for x1, y1, x2, y2 in boxes]
-            # Color jitter
             if random.random() < 0.5:
                 image = TF.adjust_brightness(image, random.uniform(0.7, 1.3))
             if random.random() < 0.5:
@@ -310,24 +339,87 @@ def collate_fn(batch):
 
 
 # =============================================================================
+# MODULES D'ATTENTION (CBAM)
+# =============================================================================
+
+class ChannelAttention(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        mid = max(channels // reduction, 4)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Conv2d(channels, mid, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid, channels, 1, bias=False),
+        )
+        self.sigmoid = nn.Sigmoid()
+        nn.init.zeros_(self.fc[-1].weight)
+
+    def forward(self, x):
+        return x * self.sigmoid(self.fc(self.avg_pool(x)) + self.fc(self.max_pool(x)))
+
+
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super().__init__()
+        self.conv    = nn.Conv2d(2, 1, kernel_size=kernel_size,
+                                 padding=kernel_size // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+        nn.init.zeros_(self.conv.weight)
+
+    def forward(self, x):
+        avg = x.mean(dim=1, keepdim=True)
+        mx, _ = x.max(dim=1, keepdim=True)
+        return x * self.sigmoid(self.conv(torch.cat([avg, mx], dim=1)))
+
+
+class CBAM(nn.Module):
+    def __init__(self, channels, reduction=16, kernel_size=7):
+        super().__init__()
+        self.ca = ChannelAttention(channels, reduction)
+        self.sa = SpatialAttention(kernel_size)
+
+    def forward(self, x):
+        return self.sa(self.ca(x))
+
+
+class AttentionBackbone(nn.Module):
+    """Applique CBAM sur chaque feature map retournée par le backbone SSD."""
+    def __init__(self, backbone, channels, cbam_reduction=16, cbam_kernel_size=7):
+        super().__init__()
+        self.backbone   = backbone
+        self.attentions = nn.ModuleList([
+            CBAM(c, cbam_reduction, cbam_kernel_size) for c in channels
+        ])
+
+    def forward(self, x):
+        features = self.backbone(x)
+        result = {}
+        for i, (k, v) in enumerate(features.items()):
+            attn = self.attentions[i] if i < len(self.attentions) else nn.Identity()
+            result[k] = attn(v)
+        return result
+
+
+def _probe_backbone_channels(backbone, image_size):
+    """Détecte les dimensions des feature maps via un forward factice."""
+    backbone.eval()
+    with torch.no_grad():
+        dummy = torch.zeros(1, 3, image_size, image_size)
+        feats = backbone(dummy)
+    return [f.shape[1] for f in feats.values()]
+
+
+# =============================================================================
 # MODÈLE
 # =============================================================================
 
-def build_model(model_name, num_classes, pretrained=True):
-    """num_classes: nombre de classes AVEC background."""
+def _rebuild_head(model, model_name, num_classes):
+    """Recrée la tête de classification pour num_classes."""
     if model_name == "ssd300_vgg16":
-        weights = SSD300_VGG16_Weights.DEFAULT if pretrained else None
-        model   = ssd300_vgg16(weights=weights)
         in_channels = [512, 1024, 512, 256, 256, 256]
-        num_anchors = model.anchor_generator.num_anchors_per_location()
-        model.head.classification_head = SSDClassificationHead(
-            in_channels=in_channels,
-            num_anchors=num_anchors,
-            num_classes=num_classes,
-        )
-    elif model_name == "ssdlite320_mobilenet_v3_large":
-        weights = SSDLite320_MobileNet_V3_Large_Weights.DEFAULT if pretrained else None
-        model   = ssdlite320_mobilenet_v3_large(weights=weights)
+    else:
         try:
             in_channels = [
                 layer.in_channels
@@ -335,16 +427,75 @@ def build_model(model_name, num_classes, pretrained=True):
             ]
         except Exception:
             in_channels = [672, 480, 512, 256, 256, 128]
-        num_anchors = model.anchor_generator.num_anchors_per_location()
-        model.head.classification_head = SSDClassificationHead(
-            in_channels=in_channels,
-            num_anchors=num_anchors,
-            num_classes=num_classes,
-        )
+    num_anchors = model.anchor_generator.num_anchors_per_location()
+    model.head.classification_head = SSDClassificationHead(
+        in_channels=in_channels,
+        num_anchors=num_anchors,
+        num_classes=num_classes,
+    )
+
+
+def get_model_simple(model_name, num_classes, pretrained=True):
+    """SSD standard sans attention."""
+    if model_name == "ssd300_vgg16":
+        weights = SSD300_VGG16_Weights.DEFAULT if pretrained else None
+        model   = ssd300_vgg16(weights=weights)
+    elif model_name == "ssdlite320_mobilenet_v3_large":
+        weights = SSDLite320_MobileNet_V3_Large_Weights.DEFAULT if pretrained else None
+        model   = ssdlite320_mobilenet_v3_large(weights=weights)
     else:
         raise ValueError(f"Modèle inconnu: {model_name}. "
                          f"Choisir: ssd300_vgg16 | ssdlite320_mobilenet_v3_large")
+    _rebuild_head(model, model_name, num_classes)
     return model
+
+
+def get_model_attention(model_name, num_classes, pretrained=True,
+                        cbam_reduction=16, cbam_kernel_size=7):
+    """SSD avec AttentionBackbone (CBAM sur chaque feature map)."""
+    image_size = SSD_IMAGE_SIZES.get(model_name, 300)
+    model      = get_model_simple(model_name, num_classes, pretrained)
+    channels   = _probe_backbone_channels(model.backbone, image_size)
+    model.backbone = AttentionBackbone(model.backbone, channels,
+                                       cbam_reduction, cbam_kernel_size)
+    print(f"   AttentionBackbone (CBAM r={cbam_reduction}, k={cbam_kernel_size}) "
+          f"sur {len(channels)} feature maps : {channels}")
+    return model
+
+
+# =============================================================================
+# PONDÉRATION PAR AUG_COEFFS (WeightedRandomSampler)
+# =============================================================================
+
+def compute_sample_weights(coco, image_ids, cat_mapping, classes, aug_coeffs):
+    """
+    Calcule les poids d'échantillonnage à partir des coefficients --aug.
+    Les images contenant des classes avec coeff élevé sont sur-échantillonnées.
+    """
+    class_idx_to_coeff = {
+        classes.index(name): coeff
+        for name, coeff in aug_coeffs.items()
+        if name in classes
+    }
+    if not class_idx_to_coeff:
+        return None
+
+    sample_weights = []
+    for img_id in image_ids:
+        anns  = coco.loadAnns(coco.getAnnIds(imgIds=img_id))
+        w     = 1.0
+        for ann in anns:
+            cls_idx = cat_mapping.get(ann['category_id'])
+            if cls_idx in class_idx_to_coeff:
+                w = max(w, float(class_idx_to_coeff[cls_idx]))
+        sample_weights.append(w)
+
+    print("   Poids d'échantillonnage (aug_coeffs):")
+    for name, coeff in aug_coeffs.items():
+        if name in classes:
+            print(f"      {name:<30} coeff={coeff}")
+
+    return torch.tensor(sample_weights, dtype=torch.float32)
 
 
 # =============================================================================
@@ -452,35 +603,38 @@ def evaluate_epoch(model, dataloader, device, class_names, score_threshold=0.3):
 
 
 # =============================================================================
-# MAIN
+# BOUCLE D'ENTRAÎNEMENT PRINCIPALE
 # =============================================================================
 
-def train_ssd(config):
-    mode              = config["mode"]
+def _train_single(config, aug_coeffs, mode_label, training_mode,
+                  cbam_reduction=16, cbam_kernel_size=7):
+    """
+    Lance un entraînement complet SSD sur config.
+    training_mode: 'simple' | 'attention'
+    """
     classes           = config["classes"]
     num_classes       = len(classes)
     class_names_no_bg = [c for c in classes if c != '__background__']
-    image_size        = SSD_IMAGE_SIZES.get(config["model_name"], 300)
+    model_name        = config["model_name"]
+    image_size        = SSD_IMAGE_SIZES.get(model_name, 300)
 
     print("=" * 70)
-    print(f"   SSD ({config['model_name']}) — Mode : {mode.upper()}")
+    print(f"   SSD ({model_name}) — Mode : {mode_label.upper()} [{training_mode}]")
     print("=" * 70)
     print(f"\n   Images:      {config['images_dir']}")
     print(f"   Annotations: {config['annotations_file']}")
-    print(f"   Modele:      {config['model_name']}")
     print(f"   Classes:     {num_classes} (avec __background__): {class_names_no_bg}")
     print(f"   Epochs:      {config['num_epochs']} | Batch: {config['batch_size']} | LR: {config['learning_rate']}")
-    print(f"   Image size:  {image_size}px (fixe pour SSD)")
+    print(f"   Image size:  {image_size}px")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"   Device:      {device}")
 
     timestamp   = datetime.now().strftime("%Y%m%d_%H%M%S")
-    train_dir   = os.path.join(config["output_dir"], f"ssd_{mode}_{timestamp}")
+    train_dir   = os.path.join(config["output_dir"], f"ssd_{mode_label}_{timestamp}")
     weights_dir = os.path.join(train_dir, "weights")
     os.makedirs(weights_dir, exist_ok=True)
 
-    # Split — cat_mapping par NOM de classe (cohérent avec classes.yaml)
     coco      = COCO(config["annotations_file"])
     cat_ids   = coco.getCatIds()
     coco_cats = {cat['id']: cat['name'] for cat in coco.loadCats(cat_ids)}
@@ -489,7 +643,7 @@ def train_ssd(config):
         if cat_name in classes:
             cat_mapping[cat_id] = classes.index(cat_name)
         else:
-            print(f"   Categorie COCO ignoree (absente du yaml) : '{cat_name}' (id={cat_id})")
+            print(f"   Catégorie COCO ignorée: '{cat_name}' (id={cat_id})")
 
     print(f"\n   cat_mapping: {[(coco_cats[k], v) for k, v in cat_mapping.items()]}")
 
@@ -499,32 +653,47 @@ def train_ssd(config):
     print_split_stats(coco, split_stats)
 
     test_info_path = os.path.join(train_dir, "test_info.json")
-    test_info = {
-        'test_image_ids':   test_ids,
-        'cat_mapping':      {str(k): v for k, v in cat_mapping.items()},
-        'images_dir':       os.path.abspath(config["images_dir"]),
-        'annotations_file': os.path.abspath(config["annotations_file"]),
-        'num_test_images':  len(test_ids),
-        'classes':          classes,
-        'model_name':       config["model_name"],
-        'image_size':       image_size,
-        'mode':             mode,
-    }
     with open(test_info_path, 'w') as f:
-        json.dump(test_info, f, indent=2)
+        json.dump({
+            'test_image_ids':   test_ids,
+            'cat_mapping':      {str(k): v for k, v in cat_mapping.items()},
+            'images_dir':       os.path.abspath(config["images_dir"]),
+            'annotations_file': os.path.abspath(config["annotations_file"]),
+            'num_test_images':  len(test_ids),
+            'classes':          classes,
+            'model_name':       model_name,
+            'image_size':       image_size,
+            'mode':             mode_label,
+        }, f, indent=2)
 
     train_dataset = SSDDataset(config["images_dir"], config["annotations_file"],
                                train_ids, cat_mapping, image_size, augment=True)
     val_dataset   = SSDDataset(config["images_dir"], config["annotations_file"],
                                val_ids,   cat_mapping, image_size)
-    train_loader  = DataLoader(train_dataset, batch_size=config["batch_size"],
-                               shuffle=True,  collate_fn=collate_fn, num_workers=0)
-    val_loader    = DataLoader(val_dataset,   batch_size=1,
-                               shuffle=False, collate_fn=collate_fn, num_workers=0)
-    print(f"\n   Train: {len(train_dataset)} | Val: {len(val_dataset)} | Test: {len(test_ids)} images")
 
-    print(f"\n   Chargement {config['model_name']} (pretrained={config['pretrained']})...")
-    model     = build_model(config["model_name"], num_classes, config["pretrained"])
+    # WeightedRandomSampler si aug_coeffs fournis
+    sample_weights = compute_sample_weights(coco, train_ids, cat_mapping,
+                                            classes, aug_coeffs)
+    if sample_weights is not None:
+        sampler      = WeightedRandomSampler(sample_weights,
+                                             num_samples=len(sample_weights),
+                                             replacement=True)
+        train_loader = DataLoader(train_dataset, batch_size=config["batch_size"],
+                                  sampler=sampler, collate_fn=collate_fn, num_workers=0)
+    else:
+        train_loader = DataLoader(train_dataset, batch_size=config["batch_size"],
+                                  shuffle=True, collate_fn=collate_fn, num_workers=0)
+
+    val_loader = DataLoader(val_dataset, batch_size=1,
+                            shuffle=False, collate_fn=collate_fn, num_workers=0)
+    print(f"\n   Train: {len(train_dataset)} | Val: {len(val_dataset)} | Test: {len(test_ids)}")
+
+    print(f"\n   Chargement {model_name} (pretrained={config['pretrained']})...")
+    if training_mode == "attention":
+        model = get_model_attention(model_name, num_classes, config["pretrained"],
+                                    cbam_reduction, cbam_kernel_size)
+    else:
+        model = get_model_simple(model_name, num_classes, config["pretrained"])
     model.to(device)
 
     params       = [p for p in model.parameters() if p.requires_grad]
@@ -575,10 +744,10 @@ def train_ssd(config):
                 'optimizer_state_dict': optimizer.state_dict(),
                 'map50': best_map50, 'num_classes': num_classes,
                 'classes': classes, 'cat_mapping': cat_mapping,
-                'model_name': config["model_name"], 'image_size': image_size,
-                'mode': mode,
+                'model_name': model_name, 'image_size': image_size,
+                'mode': mode_label, 'training_mode': training_mode,
             }, best_path)
-            print(f"   Meilleur modele sauvegarde (mAP@50: {best_map50:.4f})")
+            print(f"   Meilleur modèle sauvegardé (mAP@50: {best_map50:.4f})")
 
         if epoch % config["save_every"] == 0 or epoch == config["num_epochs"]:
             torch.save({
@@ -586,8 +755,8 @@ def train_ssd(config):
                 'optimizer_state_dict': optimizer.state_dict(),
                 'map50': val_map50, 'num_classes': num_classes,
                 'classes': classes, 'cat_mapping': cat_mapping,
-                'model_name': config["model_name"], 'image_size': image_size,
-                'mode': mode,
+                'model_name': model_name, 'image_size': image_size,
+                'mode': mode_label, 'training_mode': training_mode,
             }, os.path.join(weights_dir, "last.pth"))
 
     total_time = time.time() - start_time
@@ -600,25 +769,25 @@ def train_ssd(config):
             shutil.copy2(src_path, dst_path)
             print(f"   {dst} ({os.path.getsize(dst_path)/1024/1024:.1f} MB)")
 
-    # model_info_{mode}.json
     model_info = {
-        "model":       f"SSD_{mode}",
-        "model_name":  config["model_name"],
-        "mode":        mode,
-        "best_model":  os.path.abspath(best_model_path),
-        "train_dir":   os.path.abspath(train_dir),
-        "test_info":   os.path.abspath(test_info_path),
-        "classes":     classes,
-        "num_classes": num_classes,
-        "image_size":  image_size,
-        "best_map50":  best_map50,
-        "timestamp":   timestamp,
+        "model":          f"SSD_{mode_label}",
+        "model_name":     model_name,
+        "mode":           mode_label,
+        "training_mode":  training_mode,
+        "best_model":     os.path.abspath(best_model_path),
+        "train_dir":      os.path.abspath(train_dir),
+        "test_info":      os.path.abspath(test_info_path),
+        "classes":        classes,
+        "num_classes":    num_classes,
+        "image_size":     image_size,
+        "best_map50":     best_map50,
+        "timestamp":      timestamp,
     }
-    info_path = os.path.join(config["output_dir"], f"model_info_{mode}.json")
+    info_path = os.path.join(config["output_dir"], f"model_info_{mode_label}.json")
     os.makedirs(config["output_dir"], exist_ok=True)
     with open(info_path, 'w') as f:
         json.dump(model_info, f, indent=2)
-    print(f"\n   model_info_{mode}.json -> {info_path}")
+    print(f"\n   model_info_{mode_label}.json -> {info_path}")
 
     history['best_map50'] = best_map50
     history['config']     = {k: str(v) for k, v in config.items()}
@@ -629,8 +798,8 @@ def train_ssd(config):
         epochs_r = range(1, len(history['train_loss']) + 1)
         fig, axes = plt.subplots(1, 3, figsize=(15, 5))
         axes[0].plot(epochs_r, history['train_loss'], 'b-', label='Total')
-        axes[0].plot(epochs_r, history['cls_loss'],  'r--', label='Cls')
-        axes[0].plot(epochs_r, history['bbox_loss'], 'g--', label='BBox')
+        axes[0].plot(epochs_r, history['cls_loss'],   'r--', label='Cls')
+        axes[0].plot(epochs_r, history['bbox_loss'],  'g--', label='BBox')
         axes[0].set_title('Loss (train)'); axes[0].legend(); axes[0].grid(True, alpha=0.3)
         axes[1].plot(epochs_r, history['val_map50'], 'g-')
         axes[1].set_title('mAP@50 (validation)'); axes[1].set_ylim(0, 1); axes[1].grid(True, alpha=0.3)
@@ -641,9 +810,10 @@ def train_ssd(config):
         plt.close()
 
     with open(os.path.join(train_dir, "training_report.txt"), 'w', encoding='utf-8') as f:
-        f.write(f"SSD ({config['model_name']}) — Mode {mode}\n{'='*50}\n\n")
-        f.write(f"Mode:            {mode}\n")
-        f.write(f"Modele:          {config['model_name']}\n")
+        f.write(f"SSD ({model_name}) — Mode {mode_label} [{training_mode}]\n{'='*50}\n\n")
+        f.write(f"Mode:            {mode_label}\n")
+        f.write(f"Training mode:   {training_mode}\n")
+        f.write(f"Modèle:          {model_name}\n")
         f.write(f"Classes:         {classes}\n")
         f.write(f"Epochs:          {config['num_epochs']} | Batch: {config['batch_size']}\n\n")
         f.write(f"Meilleur mAP@50: {best_map50:.4f}\n")
@@ -651,23 +821,155 @@ def train_ssd(config):
         f.write(f"Chemin:          {train_dir}\n")
 
     print("\n" + "=" * 70)
-    print(f"   TERMINE — Mode {mode.upper()}")
+    print(f"   TERMINÉ — Mode {mode_label.upper()} [{training_mode}]")
     print("=" * 70)
     print(f"   Meilleur mAP@50: {best_map50:.4f} ({best_map50*100:.2f}%)")
     print(f"   Temps: {format_time(total_time)}")
-    print(f"   Modele: {best_model_path}")
+    print(f"   Modèle: {best_model_path}")
     print("=" * 70)
 
     return model, history
 
 
+# =============================================================================
+# OPTIMISATION OPTUNA
+# =============================================================================
+
+def _run_optimization(config, aug_coeffs, mode_label, cbam_reduction, cbam_kernel_size,
+                      n_trials, n_epochs_per_trial):
+    import optuna
+    from optuna.samplers import TPESampler
+    from optuna.pruners import MedianPruner
+
+    classes           = config["classes"]
+    num_classes       = len(classes)
+    class_names_no_bg = [c for c in classes if c != '__background__']
+    model_name        = config["model_name"]
+    image_size        = SSD_IMAGE_SIZES.get(model_name, 300)
+    device            = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    coco      = COCO(config["annotations_file"])
+    coco_cats = {cat['id']: cat['name'] for cat in coco.loadCats(coco.getCatIds())}
+    cat_mapping = {
+        cat_id: classes.index(cat_name)
+        for cat_id, cat_name in coco_cats.items()
+        if cat_name in classes
+    }
+
+    train_ids, val_ids, _, _ = stratified_split(
+        coco, config["train_split"], config["val_split"], config["test_split"], seed=42
+    )
+
+    sample_weights = compute_sample_weights(coco, train_ids, cat_mapping,
+                                            classes, aug_coeffs)
+
+    # Charge le modèle une seule fois et copie l'état initial
+    print(f"   Chargement modèle de référence pour Optuna...")
+    ref_model     = get_model_simple(model_name, num_classes, config["pretrained"])
+    initial_state = copy.deepcopy(ref_model.state_dict())
+    del ref_model
+    gc.collect()
+
+    def objective(trial):
+        lr           = trial.suggest_float("lr",           1e-4, 1e-1, log=True)
+        weight_decay = trial.suggest_float("weight_decay", 1e-5, 1e-2, log=True)
+        momentum     = trial.suggest_float("momentum",     0.7,  0.99)
+        use_cbam     = trial.suggest_categorical("use_cbam", [True, False])
+
+        if use_cbam:
+            reduction  = trial.suggest_categorical("cbam_reduction",  [8, 16, 32])
+            kernel_size = trial.suggest_categorical("cbam_kernel_size", [3, 5, 7])
+            model = get_model_attention(model_name, num_classes, pretrained=False,
+                                        cbam_reduction=reduction,
+                                        cbam_kernel_size=kernel_size)
+        else:
+            model = get_model_simple(model_name, num_classes, pretrained=False)
+            model.load_state_dict(copy.deepcopy(initial_state), strict=False)
+        model.to(device)
+
+        train_dataset = SSDDataset(config["images_dir"], config["annotations_file"],
+                                   train_ids, cat_mapping, image_size, augment=True)
+        val_dataset   = SSDDataset(config["images_dir"], config["annotations_file"],
+                                   val_ids,   cat_mapping, image_size)
+
+        if sample_weights is not None:
+            sampler      = WeightedRandomSampler(sample_weights,
+                                                 num_samples=len(sample_weights),
+                                                 replacement=True)
+            train_loader = DataLoader(train_dataset, batch_size=config["batch_size"],
+                                      sampler=sampler, collate_fn=collate_fn, num_workers=0)
+        else:
+            train_loader = DataLoader(train_dataset, batch_size=config["batch_size"],
+                                      shuffle=True, collate_fn=collate_fn, num_workers=0)
+
+        val_loader = DataLoader(val_dataset, batch_size=1,
+                                shuffle=False, collate_fn=collate_fn, num_workers=0)
+
+        optimizer = torch.optim.SGD(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=lr, momentum=momentum, weight_decay=weight_decay,
+        )
+
+        best_val_map = 0.0
+        for ep in range(n_epochs_per_trial):
+            train_one_epoch(model, optimizer, train_loader, device, config["grad_clip"])
+            val_map50, _ = evaluate_epoch(model, val_loader, device,
+                                          class_names_no_bg, config["score_threshold"])
+            best_val_map = max(best_val_map, val_map50)
+            trial.report(val_map50, ep)
+            if trial.should_prune():
+                raise optuna.exceptions.TrialPruned()
+
+        del model; gc.collect()
+        return best_val_map
+
+    output_dir = OPTUNA_CONFIG["output_dir"]
+    os.makedirs(output_dir, exist_ok=True)
+
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=TPESampler(),
+        pruner=MedianPruner(),
+        study_name=f"{OPTUNA_CONFIG['study_name']}_{mode_label}",
+    )
+    print(f"\n   Optuna: {n_trials} trials × {n_epochs_per_trial} epochs chacun")
+    study.optimize(objective, n_trials=n_trials)
+
+    best = study.best_params
+    print(f"\n   Meilleurs hyperparamètres: {best}")
+
+    with open(os.path.join(output_dir, f"optuna_best_{mode_label}.json"), 'w') as f:
+        json.dump({"best_params": best, "best_value": study.best_value}, f, indent=2)
+
+    return best
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
 def main():
     parser = argparse.ArgumentParser(
-        description="SSD — detection des toitures (mode nadir/oblique/all)",
+        description="SSD — détection des toitures cadastrales",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--mode",             default="all", choices=["nadir", "oblique", "all"],
-                        help="Mode d'entrainement")
+    parser.add_argument(
+        "--mode", default="simple",
+        choices=["simple", "attention", "optimize", "dual",
+                 "nadir", "oblique", "all"],  # nadir/oblique/all: alias dépréciés
+        help="Mode d'entraînement",
+    )
+    parser.add_argument("--aug",            nargs="*", default=[],
+                        metavar="CLASS:COEFF",
+                        help="Coefficients d'oversampling par classe (ex: panneau_solaire:3)")
+    parser.add_argument("--cbam-reduction", type=int, default=16,
+                        help="Facteur de réduction CBAM (ChannelAttention)")
+    parser.add_argument("--cbam-kernel-size", type=int, default=7,
+                        help="Taille du kernel CBAM (SpatialAttention)")
+    parser.add_argument("--n-trials",       type=int, default=OPTUNA_CONFIG["n_trials"],
+                        help="Nombre de trials Optuna")
+    parser.add_argument("--n-epochs-trial", type=int, default=OPTUNA_CONFIG["n_epochs_per_trial"],
+                        help="Epochs par trial Optuna")
     parser.add_argument("--images-dir",       default=None)
     parser.add_argument("--annotations-file", default=None)
     parser.add_argument("--output-dir",       default=None)
@@ -676,9 +978,74 @@ def main():
                         choices=["ssd300_vgg16", "ssdlite320_mobilenet_v3_large"])
     args = parser.parse_args()
 
-    config           = build_config(args)
-    config["classes"] = load_classes(config["classes_file"], mode=config["mode"])
-    train_ssd(config)
+    # Alias dépréciés
+    mode = args.mode
+    if mode == "nadir":
+        print("[DEPRECATED] --mode nadir est déprécié. Utilisez --mode dual ou --mode simple avec --annotations-file instances_nadir.json")
+        args.mode = "simple"
+    elif mode == "oblique":
+        print("[DEPRECATED] --mode oblique est déprécié. Utilisez --mode dual ou --mode simple avec --annotations-file instances_oblique.json")
+        args.mode = "simple"
+    elif mode == "all":
+        print("[DEPRECATED] --mode all est déprécié. Utilisez --mode simple.")
+        args.mode = "simple"
+    mode = args.mode
+
+    config = build_config(args)
+
+    if mode == "dual":
+        # Nadir : panneau_solaire
+        nadir_cfg          = _build_sub_config(config, "nadir")
+        nadir_cfg["classes"] = load_classes(config["classes_file"],
+                                            MODE_CLASSES["nadir"])
+        aug_coeffs = parse_aug_coeffs(args.aug, nadir_cfg["classes"])
+        class_names_no_bg = [c for c in nadir_cfg["classes"] if c != '__background__']
+        print(f"\n[DUAL] Phase 1 — Nadir ({class_names_no_bg})")
+        _train_single(nadir_cfg, aug_coeffs, "nadir", "simple",
+                      args.cbam_reduction, args.cbam_kernel_size)
+
+        # Oblique : 4 classes bâtiment
+        oblique_cfg          = _build_sub_config(config, "oblique")
+        oblique_cfg["classes"] = load_classes(config["classes_file"],
+                                              MODE_CLASSES["oblique"])
+        aug_coeffs = parse_aug_coeffs(args.aug, oblique_cfg["classes"])
+        class_names_no_bg = [c for c in oblique_cfg["classes"] if c != '__background__']
+        print(f"\n[DUAL] Phase 2 — Oblique ({class_names_no_bg})")
+        _train_single(oblique_cfg, aug_coeffs, "oblique", "simple",
+                      args.cbam_reduction, args.cbam_kernel_size)
+
+    elif mode == "optimize":
+        all_mode_classes = (MODE_CLASSES["nadir"] + MODE_CLASSES["oblique"])
+        config["classes"] = load_classes(config["classes_file"], all_mode_classes)
+        aug_coeffs        = parse_aug_coeffs(args.aug, config["classes"])
+        best_params = _run_optimization(
+            config, aug_coeffs, "all",
+            args.cbam_reduction, args.cbam_kernel_size,
+            args.n_trials, args.n_epochs_trial,
+        )
+        # Entraînement final avec les meilleurs hyperparamètres
+        use_cbam = best_params.get("use_cbam", False)
+        config["learning_rate"] = best_params.get("lr",           config["learning_rate"])
+        config["weight_decay"]  = best_params.get("weight_decay", config["weight_decay"])
+        config["momentum"]      = best_params.get("momentum",     config["momentum"])
+        cbam_r = best_params.get("cbam_reduction",  args.cbam_reduction)
+        cbam_k = best_params.get("cbam_kernel_size", args.cbam_kernel_size)
+        training_mode = "attention" if use_cbam else "simple"
+        _train_single(config, aug_coeffs, "all", training_mode, cbam_r, cbam_k)
+
+    elif mode == "attention":
+        all_mode_classes  = (MODE_CLASSES["nadir"] + MODE_CLASSES["oblique"])
+        config["classes"] = load_classes(config["classes_file"], all_mode_classes)
+        aug_coeffs        = parse_aug_coeffs(args.aug, config["classes"])
+        _train_single(config, aug_coeffs, "all", "attention",
+                      args.cbam_reduction, args.cbam_kernel_size)
+
+    else:  # simple (+ anciens alias nadir/oblique/all redirigés ici)
+        all_mode_classes  = (MODE_CLASSES["nadir"] + MODE_CLASSES["oblique"])
+        config["classes"] = load_classes(config["classes_file"], all_mode_classes)
+        aug_coeffs        = parse_aug_coeffs(args.aug, config["classes"])
+        _train_single(config, aug_coeffs, "all", "simple",
+                      args.cbam_reduction, args.cbam_kernel_size)
 
 
 if __name__ == "__main__":
